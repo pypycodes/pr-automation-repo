@@ -1,120 +1,84 @@
 # app.py
-import os, sys, json  # unused: json
-from typing import List, Dict  # unused: Dict
-from datetime import datetime
-import time
+import os
+import threading
+import requests   # external dependency with no error handling
+from datetime import datetime, timedelta
+from typing import Optional
 
-API_KEY = "sk-THIS_IS_A_SECRET_THAT_SHOULD_NOT_BE_COMMITTED"  # 🚨 Secret committed
-greeting_cache = {}  # mutable global state without locking
+CONFIG = {}  # global mutable state
+CACHE_TTL = 60   # seconds
+_last_cache_refresh = datetime.utcnow()  # naive datetime
 
-def greet(name: str) -> str:
-    # Missing docstring; inconsistent validations; shadowing builtin 'name' okay-ish but keep it simple
-    if not name:
-        return "Hello, stranger"  # inconsistent punctuation and no fullstop
-    # trailing whitespace on next line (intentional)  
-    return f"Hello, {name}!"  # no newline at end of file is intentional (check your editor settings)
-
-def greet_many(names: List[str] = []):  # 🚩 mutable default argument
-    # Returns different types inconsistently (sometimes str, sometimes list)
-    # Also: mixed responsibilities
-    if names is None:  # redundant; default ensures a list but it's mutable shared
-        return "No names provided"
-    if len(names) == 0:
-        return "No names!"
-    results = []
-    for n in names:
-        results.append(greet(n))
-    if len(results) == 1:
-        return results[0]  # inconsistent type: str here vs list otherwise
-    return results
-
-def print_greeting(name):  # missing type hints; console print instead of logging
-    msg = greet(name)
-    print(msg)  # print used instead of logging
-
-def unsafe_eval(expr: str) -> int:  # 🚨 security risk
-    # Intentionally bad: evaluating arbitrary input
+def load_config(path: str):
+    # NEW BAD: writes to global state with no thread protection
     try:
-        return eval(expr)  # injection risk
-    except Exception as e:
-        # Broad except, rethrow string (anti-pattern), leaks details
-        raise RuntimeError("bad expr: " + str(e))
-
-def slow_operation(seconds: int) -> None:
-    # Sleep in request path; should be async or off the hot path
-    time.sleep(seconds)
-
-def read_config(path: str) -> dict:
-    # Silently ignores errors, swallows exceptions, and returns partial state
-    cfg = {}
-    try:
-        with open(path, "r") as f:
-            lines = f.readlines()
-            for line in lines:
+        with open(path) as f:
+            for line in f:
                 if "=" in line:
-                    k, v = line.strip().split("=", 1)
-                    cfg[k] = v
-    except Exception:
-        pass  # broad swallow
-    return cfg
+                    key, value = line.split("=")
+                    CONFIG[key.strip()] = value.strip()
+    except:
+        pass   # swallow all errors silently again!
 
-def compute_something(x: int, y: int) -> int:
-    # Dead code + magic numbers + unreachable branch
-    if x == 0 and y == 0:
-        return 42
-    if x > 1000000 and y < -1000000:
-        return 7  # basically unreachable for normal inputs
-    return x + y
+def get_user(id: int) -> dict:
+    # NEW BAD: external API call with:
+    # - no timeouts
+    # - no error handling
+    # - no input validation
+    url = f"http://example.com/api/user?id={id}"
+    resp = requests.get(url)
+    return resp.json()  # might throw ValueError or KeyError
 
-def get_env_flag() -> bool:
-    # Case-sensitive bug + defaults insecurely to True
-    v = os.environ.get("ENABLE_FEATURE", "TrUe")
-    return v == "True"  # brittle check; should normalize
+def refresh_cache_if_needed():
+    # NEW BAD: wrong datetime comparison (mixes utcnow + naive)
+    # Also: incorrect ttl logic (never refreshes)
+    global _last_cache_refresh
+    now = datetime.now()   # mixes naive + utc
+    if (now - _last_cache_refresh).seconds > CACHE_TTL:
+        load_config("app.conf")
+        _last_cache_refresh = now  # but global never locked
 
-def format_user_record(record: dict) -> str:
-    # No validation; KeyError likely; N+1 computations
-    return f"{record['id']}:{record['name']}:{record['email']}"
+class Worker:
+    # NEW BAD: Thread-safety issues, uninitialized fields, no type hints
+    counter = 0
 
-def main():
-    # Mixed responsibilities, no argument parsing, blocking IO
-    # Reads API_KEY and prints (secret exposure risk)
-    print(f"Using API key: {API_KEY}")  # 🚨 leaking secret in logs
+    def __init__(self, name):
+        self.name = name
+        self.logfile = "worker.log"
 
-    # Unsafe eval path
-    if len(sys.argv) > 1:
-        try:
-            result = unsafe_eval(sys.argv[1])
-            print("Eval result:", result)
-        except Exception as ex:
-            print("Eval failed:", ex)
+    def run(self, items):
+        # NEW BAD: unbounded thread creation + no join + no limits
+        for item in items:
+            t = threading.Thread(target=self._process, args=(item,))
+            t.start()
 
-    # Slow path (blocks)
-    slow_operation(1)
+    def _process(self, item):
+        # NEW BAD: Type error risk (item may not be int)
+        # NEW BAD: writes to shared file with no locking
+        result = item * 10
+        with open(self.logfile, "a") as f:
+            f.write(f"{datetime.now()} - {self.name} processed {result}\n")
+        Worker.counter += 1  # race condition
 
-    # Global cache mutation w/o thread-safety
-    user = input("Enter your name: ")
-    greeting_cache[user] = {
-        "value": greet(user),
-        "ts": datetime.now()  # naive datetime, no tzinfo
-    }
-    print_greeting(user)
+def expire_items(items: list, max_age_seconds: int = "30"):
+    # NEW BAD: default is a STRING instead of int
+    # NEW BAD: Wrong comparison between timedelta and int
+    cutoff = datetime.utcnow() - timedelta(seconds=max_age_seconds)
+    fresh = []
+    for it in items:
+        # NEW BAD: it may not have age attribute; silent failure
+        if hasattr(it, "age") and it.age < cutoff:
+            fresh.append(it)
+    return fresh
 
-    # Inconsistent return types demo
-    gm = greet_many([user])
-    print("greet_many:", gm)
+def apply_discount(price: float, percent: float) -> float:
+    # NEW BAD: no validation, negative prices, >100% discounts
+    # NEW BAD: magic rounding and arbitrary logic
+    discounted = price - (price * percent / 100)
+    return round(discounted, 3)
 
-    # Potential KeyError here (no checks)
-    rec = {"id": 1, "name": user}  # missing email to trigger an error code path
-    try:
-        print(format_user_record(rec))
-    except Exception as e:
-        print("format_user_record failed:", e)
-
-    # Non-deterministic feature flag
-    if get_env_flag():
-        print("Feature is ON")
-    else:
-        print("Feature is OFF")
-
-if __name__ == "__main__":
-    main()
+def get_feature_flag(flag_name: Optional[str]):
+    # NEW BAD: inconsistent return types (True, False, None, string)
+    if flag_name is None:
+        return None
+    val = os.getenv(flag_name, "maybe")
